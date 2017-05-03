@@ -34,6 +34,9 @@ defmodule KafkaGenStage do
   :topics - ["no_topic"]
   :group - "kgs_cg"
   :nof_clients - 2
+  :begin_offset - :latest
+    This argument is given directly to the brod client, so it ca be
+    [:earliest, :latest]
 
   Given as a keyword lists, i.e.
 
@@ -65,7 +68,7 @@ defmodule KafkaGenStage do
   """
   def handle_demand(nof_wanted, state) when nof_wanted > 0 do
     {head, rest} = Enum.split(state.msg_stack, nof_wanted)
-    {:reply, head, %{state | msg_stack: rest}}
+    {:noreply, head, %{state | msg_stack: rest}}
   end
 
   @doc """
@@ -128,41 +131,38 @@ defmodule KafkaGenStage do
   end
 
 
-  @doc """
-
-  Setup a group consumer on all partitions for the topic given.
-
-  """
+  # Setup a group consumer on all partitions for the topic given.
   defp bootstrapConsumer(kafka_options) do
     kafka_hosts = Keyword.get(kafka_options, :host, [localhost: 9092])
     kafka_topics = Keyword.get(kafka_options, :topics, ["no_topic"])
     consumer_group_name = Keyword.get(kafka_options, :group, "kgs_cg")
     nof_clients = Keyword.get(kafka_options, :nof_clients, 2)
+    begin_offset = Keyword.get(kafka_options, :begin_offset, :latest)
 
     kafka_clients = for i <- 1..nof_clients, do: String.to_atom("kgc_client_#{i}")
 
-    :ok = bootstrapSubscribers(kafka_clients, kafka_hosts, consumer_group_name, kafka_topics)
+    :ok = bootstrapSubscribers(kafka_clients, kafka_hosts, consumer_group_name, kafka_topics, begin_offset)
   end
 
-  defp bootstrapSubscribers([], _kafka_hosts, _group_id, _topics), do: :ok
-  defp bootstrapSubscribers([client_id | rest], kafka_hosts, group_id, topics) do
+  defp bootstrapSubscribers([], _kafka_hosts, _group_id, _topics, _begin_offset), do: :ok
+  defp bootstrapSubscribers([client_id | rest], kafka_hosts, group_id, topics, begin_offset) do
     :ok = :brod.start_client(kafka_hosts, client_id, _client_config=[])
     group_config = [offset_commit_policy: :commit_to_kafka_v2,
                     offset_commit_interval_seconds: 5,
                     rejoin_delay_seconds: 2 ]
 
     {:ok, _subscriber} = :brod.start_link_group_subscriber(client_id, group_id, topics, group_config,
-                                        _consumer_config = [begin_offset: :earliest],
+                                        _consumer_config = [begin_offset: begin_offset],
                                         _callback_module = __MODULE__,
                                         _callback_init_args = {client_id, topics, self()})
-    bootstrapSubscribers(rest, kafka_hosts, group_id, topics)
+    bootstrapSubscribers(rest, kafka_hosts, group_id, topics, begin_offset)
   end
 
-  defp spawn_message_handlers(_client_id, [], gs_pid), do: %{}
+  defp spawn_message_handlers(_client_id, [], _gs_pid), do: %{}
   defp spawn_message_handlers(client_id, [topic | rest], gs_pid) do
     {:ok, partition_count} = :brod.get_partitions_count(client_id, topic)
     handlers = Enum.reduce :lists.seq(0, partition_count-1), %{}, fn partition, acc ->
-      handler_pid = spawn_link(__MODULE__, :message_handler_loop, [topic, partition, self, gs_pid])
+      handler_pid = spawn_link(__MODULE__, :message_handler_loop, [topic, partition, self(), gs_pid])
       Map.put(acc, "#{topic}-#{partition}", handler_pid)
     end
     Map.merge(handlers, spawn_message_handlers(client_id, rest, gs_pid))
